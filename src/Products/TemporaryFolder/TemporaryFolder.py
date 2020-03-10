@@ -10,88 +10,121 @@
 # FOR A PARTICULAR PURPOSE
 #
 ##############################################################################
-""" Mounted database support
+""" A storage implementation which uses RAM to persist objects
 
-A MountedTemporaryFolder is an object that is a mount point.  It mounts a
-TemporaryStorage-backed database and masquerades as its root object.
-When you traverse one of these things, the __of__ method of the mount
-point object is called, and that returns a Folder object that actually
-lives in another ZODB.
+Although this storage is much like MappingStorage, it does not need to be
+packed to get rid of non-cyclic garbage and it does rudimentary conflict
+resolution.
 
-To understand this fully, you'll need to read the source of
-Products.TemporaryFolder.mount.MountPoint.
+This is a ripoff of Jim's Packless bsddb3 storage.
 """
+import bisect
+from logging import getLogger
+import time
 
-from App.special_dtml import DTMLFile
-from App.special_dtml import HTMLFile
-from OFS.Folder import Folder
-from OFS.SimpleItem import Item
-from tempstorage.TemporaryStorage import TemporaryStorage
-from ZODB.DB import DB
+from ZODB import POSException
+from ZODB.BaseStorage import BaseStorage
+from ZODB.serialize import referencesf
+from ZODB.utils import z64
 
-from Products.TemporaryFolder.mount import MountPoint
-
-ADD_TEMPORARY_FOLDER_PERM = "Add Temporary Folder"
-
-
-def constructTemporaryFolder(self, id, title=None, REQUEST=None):
-    """ """
-    ms = MountedTemporaryFolder(id, title)
-    self._setObject(id, ms)
-    if REQUEST is not None:
-        return self.manage_main(self, REQUEST, update_menu=1)
+LOG = getLogger('TemporaryStorage')
 
 
-constructTemporaryFolderForm = HTMLFile('dtml/addTemporaryFolder', globals())
+class Transaction(object):
+    """Hold data for current transaction for MinimalMemoryStorage."""
 
+    def __init__(self, tid):
+        self.index = {}
+        self.tid = tid
 
-class SimpleTemporaryContainer(Folder):
-    # dbtab-style container class
-    meta_type = 'Temporary Folder'
-    zmi_icon = 'far fa-hdd'
+    def store(self, oid, data):
+        self.index[(oid, self.tid)] = data
 
+    def cur(self):
+        return dict.fromkeys([oid for oid, tid in self.index.keys()], self.tid)
 
-class MountedTemporaryFolder(MountPoint, Item):
-    """
-    A mounted RAM database with a basic interface for displaying the
-    reason the database did not connect.
+class TemporaryStorage(BaseStorage, object):
 
-    XXX this is only here for backwards compatibility purposes:
-    DBTab uses the SimpleTemporaryContainer class instead.
-    """
-    manage_options = (
-        {'label': 'Traceback', 'action': 'manage_traceback'},
-    )
-    meta_type = 'Broken Temporary Folder'
-    zmi_icon = 'far fa-hdd text-danger'
+    def __init__(self, name='TemporaryStorage'):
+        """ """
+        BaseStorage.__init__(self, name)
+        # _index maps oid, tid pairs to data records
+        self._index = {}
+        # _cur maps oid to current tid
+        self._cur = {}
 
-    def __init__(self, id, title='', params=None):
-        self.id = str(id)
-        self.title = title
-        MountPoint.__init__(self, path='/')  # Eep
+        self._ltid = z64
 
-    manage_traceback = DTMLFile('dtml/mountfail', globals())
+    def isCurrent(self, oid, serial):
+        return serial == self._cur[oid]
 
-    def _createDB(self):
-        """ Create a mounted RAM database """
-        return DB(TemporaryStorage())
+    def hook(self, oid, tid, version):
+        # A hook for testing
+        pass
 
-    def _getMountRoot(self, root):
-        sdc = root.get('folder', None)
-        if sdc is None:
-            sdc = root['folder'] = Folder()
-            self._populate(sdc, root)
+    def __len__(self):
+        return len(self._index)
 
-        return sdc
+    def _clear_temp(self):
+        pass
 
-    def mount_error_(self):
-        return self._v_connect_error
+    def load(self, oid, version=''):
+        assert version == ''
+        with self._lock:
+            assert not version
+            tid = self._cur[oid]
+            self.hook(oid, tid, '')
+            return self._index[(oid, tid)], tid
 
-    def _populate(self, folder, root):
-        # Set up our folder object
-        folder.id = self.id
-        folder.title = self.title
-        s = folder.manage_options[1:]
-        folder.manage_options = (
-            {'label': 'Contents', 'action': 'manage_main'},
-        ) + s
+    def _begin(self, tid, u, d, e):
+        self._txn = Transaction(tid)
+
+    def store(self, oid, serial, data, v, txn):
+        if txn is not self._transaction:
+            raise POSException.StorageTransactionError(self, txn)
+        assert not v
+        if self._cur.get(oid) != serial:
+            if not (serial is None or self._cur.get(oid) in [None, z64]):
+                raise POSException.ConflictError(
+                    oid=oid, serials=(self._cur.get(oid), serial), data=data)
+        self._txn.store(oid, data)
+        return self._tid
+
+    def _abort(self):
+        del self._txn
+
+    def _finish(self, tid, u, d, e):
+        with self._lock:
+            self._index.update(self._txn.index)
+            self._cur.update(self._txn.cur())
+            self._ltid = self._tid
+
+    def loadBefore(self, the_oid, the_tid):
+        # It's okay if loadBefore() is really expensive, because this
+        # storage is just used for testing.
+        with self._lock:
+            tids = [tid for oid, tid in self._index if oid == the_oid]
+            if not tids:
+                raise KeyError(the_oid)
+            tids.sort()
+            i = bisect.bisect_left(tids, the_tid) - 1
+            if i == -1:
+                return None
+            tid = tids[i]
+            j = i + 1
+            if j == len(tids):
+                end_tid = None
+            else:
+                end_tid = tids[j]
+
+            self.hook(the_oid, self._cur[the_oid], '')
+
+            return self._index[(the_oid, tid)], tid, end_tid
+
+    def loadSerial(self, oid, serial):
+        return self._index[(oid, serial)]
+
+    def close(self):
+        pass
+
+    cleanup = close
